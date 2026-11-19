@@ -1,0 +1,2 @@
+timestamp,symbol,direction,setup_type,confluence_score,entry_price,stop_loss,target_1,target_2,risk_reward,status
+2026-11-20 00:22:05,NIFTY,SHORT,A+ INSTITUTIONAL SETUP,95,24995.0,25005.0,24975.0,24900.0,1 : 2.0,OPEN

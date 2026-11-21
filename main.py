@@ -12,6 +12,9 @@ from telegram_notifier import TelegramNotifier
 from news_feed import ForexFactoryCalendar
 from confluence_engine import ConfluenceEngine
 from trade_logger import SignalLogger
+from instrument_manager import update_config_tokens
+from option_chain_fetcher import OptionChainFetcher
+from websocket_feed import WebSocketFeed, build_callbacks
 
 def display_economic_news():
     """
@@ -171,157 +174,147 @@ def run_simulation():
 
 def run_angel_live():
     """
-    Connects to Angel One SmartAPI and streams live market quotes, volume & OI at zero cost.
+    Connects to Angel One SmartAPI with:
+      - Auto-rollover Nifty Futures token (instrument_manager)
+      - Real-time WebSocket feed instead of 2s REST polling (websocket_feed)
+      - Live option chain levels refreshed every 5 min (option_chain_fetcher)
     """
     print("\n" + "="*65, flush=True)
-    print("   CONNECTING TO LIVE ANGEL ONE SMARTAPI (FREE LIVE DATA)", flush=True)
+    print("   CONNECTING TO LIVE ANGEL ONE SMARTAPI (REAL-TIME FEED)", flush=True)
     print("="*65 + "\n", flush=True)
+
+    # ── STEP 1: Auto-rollover Nifty Futures token ──────────────────────────
+    resolved = update_config_tokens()
+    print(
+        f"[AUTO-ROLLOVER] Nifty Futures → Token: {resolved['token']} | "
+        f"Symbol: {resolved['symbol']} | Expiry: {resolved['expiry']}",
+        flush=True
+    )
 
     client = AngelClientManager()
     if not client.is_connected():
         print("[ERROR] Angel One authentication failed. Check credentials in .env.", flush=True)
         return
 
-    print(f"[SUCCESS] Connected to Angel One SmartAPI! User: {client.user_profile.get('name')}", flush=True)
+    print(f"[SUCCESS] Connected to Angel One! User: {client.user_profile.get('name')}", flush=True)
     display_economic_news()
 
-    notifier = TelegramNotifier()
-    logger = SignalLogger()
+    notifier  = TelegramNotifier()
+    sig_logger = SignalLogger()
     nifty_vwap = VWAPTracker("NIFTY")
-    bn_vwap = VWAPTracker("BANKNIFTY")
-    lead_lag = LeadLagMonitor(divergence_threshold_pct=0.20)
+    bn_vwap    = VWAPTracker("BANKNIFTY")
+    lead_lag   = LeadLagMonitor(divergence_threshold_pct=0.20)
     iceberg_detector = IcebergAbsorptionDetector(
         volume_threshold=config.WHALE_VOLUME_THRESHOLD,
         price_tolerance_points=config.ABSORPTION_PRICE_POINTS,
         window_seconds=config.EVALUATION_WINDOW_SECONDS
     )
 
-    data = client.get_spot_and_futures()
-    nifty_spot = data.get(config.ANGEL_TOKENS["NIFTY_SPOT"]["token"], {})
-    bn_spot = data.get(config.ANGEL_TOKENS["BANKNIFTY_SPOT"]["token"], {})
-    nifty_fut = data.get(config.ANGEL_TOKENS["NIFTY_FUT"]["token"], {})
+    # Initial REST snapshot for day-open reference
+    data      = client.get_spot_and_futures()
+    n_spot0   = data.get(config.ANGEL_TOKENS["NIFTY_SPOT"]["token"], {})
+    bn_spot0  = data.get(config.ANGEL_TOKENS["BANKNIFTY_SPOT"]["token"], {})
+    nifty_fut0 = data.get(config.ANGEL_TOKENS["NIFTY_FUT"]["token"], {})
 
-    print(f"\n[LIVE REAL-TIME SNAPSHOT]")
-    print(f"NIFTY SPOT:      LTP {nifty_spot.get('ltp')} | Open: {nifty_spot.get('open')} | Chg: {nifty_spot.get('percent_change')}%")
-    print(f"BANKNIFTY SPOT:  LTP {bn_spot.get('ltp')} | Open: {bn_spot.get('open')} | Chg: {bn_spot.get('percent_change')}%")
-    print(f"NIFTY FUTURES:   LTP {nifty_fut.get('ltp')} | Vol: {nifty_fut.get('volume'):,} | OI: {nifty_fut.get('oi'):,} | VWAP: {nifty_fut.get('avg_price')}\n")
+    print(f"\n[SNAPSHOT]")
+    print(f"  NIFTY SPOT:    LTP {n_spot0.get('ltp')} | Open: {n_spot0.get('open')} | Chg: {n_spot0.get('percent_change')}%")
+    print(f"  BANKNIFTY:     LTP {bn_spot0.get('ltp')} | Open: {bn_spot0.get('open')} | Chg: {bn_spot0.get('percent_change')}%")
+    print(f"  NIFTY FUTURES: LTP {nifty_fut0.get('ltp')} | Vol: {nifty_fut0.get('volume', 0):,} | OI: {nifty_fut0.get('oi', 0):,}\n")
 
-    if nifty_spot.get("open", 0) > 0 and bn_spot.get("open", 0) > 0:
-        lead_lag.set_day_open(nifty_spot["open"], bn_spot["open"])
+    if n_spot0.get("open", 0) > 0 and bn_spot0.get("open", 0) > 0:
+        lead_lag.set_day_open(n_spot0["open"], bn_spot0["open"])
 
-    print("[INFO] Monitoring live stream & tape reading. Press Ctrl+C to exit.\n", flush=True)
+    # ── STEP 2: Option chain fetcher (5-min background refresh) ───────────
+    # levels_ref is a plain dict; OptionChainFetcher writes into it via threading lock
+    levels_ref = {
+        "call_wall":  0.0,
+        "put_wall":   0.0,
+        "gamma_plus": 0.0,
+        "gamma_minus": 0.0,
+        "max_pain":   0.0,
+        "pcr":        0.0,
+    }
+    oc_fetcher = OptionChainFetcher(smart_api=client.smart_api)
+    # Fetch once synchronously so we have levels before WS starts
+    initial_levels = oc_fetcher.fetch_once()
+    if initial_levels:
+        levels_ref.update(initial_levels)
+        notifier.send_alert("OPTION CHAIN LEVELS", (
+            f"Call Wall  : {initial_levels['call_wall']} (OI: {initial_levels.get('call_wall_oi', 0):,})\n"
+            f"Put Wall   : {initial_levels['put_wall']}  (OI: {initial_levels.get('put_wall_oi', 0):,})\n"
+            f"Max Pain   : {initial_levels['max_pain']}\n"
+            f"PCR        : {initial_levels['pcr']}\n"
+            f"Expiry     : {initial_levels.get('expiry', 'N/A')}"
+        ))
+        print(f"[OC] Call Wall: {initial_levels['call_wall']} | Put Wall: {initial_levels['put_wall']} | PCR: {initial_levels['pcr']}", flush=True)
+    else:
+        print("[OC] Option chain unavailable right now — using placeholder levels.", flush=True)
+        levels_ref.update({"call_wall": 25200.0, "put_wall": 25000.0})
 
-    prev_fut_vol = nifty_fut.get("volume", 0)
-    prev_fut_oi = nifty_fut.get("oi", 0)
-    prev_fut_price = nifty_fut.get("ltp", 0.0)
-    last_whale_alert = None
-
-    # Estimated nearby walls
-    levels = {"call_wall": 25200.0, "put_wall": 25000.0}
-
-    try:
+    # Keep levels_ref in sync with OptionChainFetcher on background thread
+    def _oc_sync_loop():
         while True:
-            quotes = client.get_spot_and_futures()
-            n_spot = quotes.get(config.ANGEL_TOKENS["NIFTY_SPOT"]["token"], {})
-            b_spot = quotes.get(config.ANGEL_TOKENS["BANKNIFTY_SPOT"]["token"], {})
-            n_fut = quotes.get(config.ANGEL_TOKENS["NIFTY_FUT"]["token"], {})
-
-            n_ltp = n_spot.get("ltp", 0.0)
-            b_ltp = b_spot.get("ltp", 0.0)
-            fut_ltp = n_fut.get("ltp", 0.0)
-            fut_vol = n_fut.get("volume", 0)
-            fut_oi = n_fut.get("oi", 0)
-            fut_vwap = n_fut.get("avg_price", 0.0)
-
-            # Guard against network timeouts or empty quotes
-            if not quotes or not n_fut or fut_ltp <= 0:
-                time.sleep(2)
-                continue
-
-            now = datetime.now()
-            
-            # Only compute incremental volume if previous volume was valid
-            inc_vol = (fut_vol - prev_fut_vol) if (prev_fut_vol > 0 and fut_vol >= prev_fut_vol) else 0
-            prev_fut_vol = fut_vol
-
-            # Check OI Build-up if OI changed and valid
-            if fut_oi != prev_fut_oi and prev_fut_oi > 0 and prev_fut_price > 0 and fut_ltp > 0:
-                oi_analysis = OIAnalyzer.classify_oi_buildup(prev_fut_price, fut_ltp, prev_fut_oi, fut_oi, symbol="NSE:NIFTY-I")
-                if oi_analysis.get("formatted_message"):
-                    notifier.send_alert("OI BUILD-UP", oi_analysis["formatted_message"])
-            
-            if fut_oi > 0:
-                prev_fut_oi = fut_oi
-            if fut_ltp > 0:
-                prev_fut_price = fut_ltp
-
-            # Feed to Iceberg / Absorption detector only if valid incremental volume
-            if inc_vol > 0:
-                resolved_whale_alerts = iceberg_detector.on_tick(
-                    timestamp=now, price=fut_ltp, incremental_volume=inc_vol,
-                    symbol="NSE:NIFTY-I", call_wall=levels["call_wall"], put_wall=levels["put_wall"]
-                )
-                for alert in resolved_whale_alerts:
-                    last_whale_alert = alert
-                    notifier.send_alert("WHALE ORDER ABSORPTION", alert["formatted_message"])
-
-            if n_ltp > 0 and b_ltp > 0:
-                n_state = nifty_vwap.update(now, n_ltp, 1000)
-                b_state = bn_vwap.update(now, b_ltp, 2000)
-                ll_state = lead_lag.update(n_ltp, n_state["vwap"], b_ltp, b_state["vwap"])
-
-                # Confluence evaluation
-                confluence = ConfluenceEngine.evaluate_setup(
-                    current_price=n_ltp, symbol="NIFTY",
-                    vwap_state=n_state, levels=levels,
-                    whale_alert=last_whale_alert, lead_lag_state=ll_state,
-                    timestamp=now
-                )
-                if confluence and confluence["score"] >= ConfluenceEngine.MIN_A_PLUS_SCORE:
-                    notifier.send_alert("A+ INSTITUTIONAL SETUP", confluence["formatted_message"])
-                    logger.log_trade(
-                        symbol=confluence["symbol"],
-                        direction=confluence["direction"],
-                        setup_type=confluence["grade"],
-                        score=confluence["score"],
-                        entry=confluence["entry"],
-                        sl=confluence["stop_loss"],
-                        t1=confluence["target_1"],
-                        t2=confluence["target_2"],
-                        rr=confluence["risk_reward"]
-                    )
-                    last_whale_alert = None
-
+            time.sleep(oc_fetcher.interval)
+            new_levels = oc_fetcher.fetch_once()
+            if new_levels:
+                levels_ref.update(new_levels)
                 print(
-                    f"[{now.strftime('%H:%M:%S')}] "
-                    f"NIFTY: {n_ltp:.2f} | BANKNIFTY: {b_ltp:.2f} | "
-                    f"FUTURES: {fut_ltp:.2f} (VWAP: {fut_vwap:.2f}) | "
-                    f"Lead-Lag: {ll_state['signal']}",
+                    f"[OC REFRESH] Call Wall: {new_levels['call_wall']} | "
+                    f"Put Wall: {new_levels['put_wall']} | PCR: {new_levels['pcr']}",
                     flush=True
                 )
 
-                if ll_state["banknifty_leads"] and ll_state["signal"] in ["BANKNIFTY_LEADING_BULLISH", "BANKNIFTY_LEADING_BEARISH"]:
-                    lead_msg = (
-                        f"Signal: {ll_state['signal']}\n"
-                        f"BankNifty % Chg: {ll_state['banknifty_pct_chg']}%\n"
-                        f"Nifty % Chg: {ll_state['nifty_pct_chg']}%\n"
-                        f"Spread: {ll_state['spread_pct']}%\n"
-                        f"Action: {ll_state['action_recommendation']}"
-                    )
-                    notifier.send_alert("LIVE LEAD-LAG SIGNAL", lead_msg)
+    import threading
+    _oc_thread = threading.Thread(target=_oc_sync_loop, daemon=True, name="OptionChainSync")
+    _oc_thread.start()
 
-            time.sleep(2)
+    # ── STEP 3: WebSocket real-time feed ───────────────────────────────────
+    state_ref = {}   # mutable cross-tick state container
+    callbacks = build_callbacks(
+        vwap_tracker_nifty=nifty_vwap,
+        vwap_tracker_bn=bn_vwap,
+        iceberg_detector=iceberg_detector,
+        lead_lag_monitor=lead_lag,
+        confluence_engine_cls=ConfluenceEngine,
+        oi_analyzer_cls=OIAnalyzer,
+        notifier=notifier,
+        logger_obj=sig_logger,
+        levels_ref=levels_ref,
+        state_ref=state_ref,
+    )
+    feed = WebSocketFeed(angel_client=client, callbacks=callbacks)
 
+    print("[INFO] Starting real-time WebSocket feed. Press Ctrl+C to exit.\n", flush=True)
+    notifier.send_alert("SYSTEM", (
+        f"🚀 Trading Engine LIVE\n"
+        f"Mode: WebSocket (tick-by-tick)\n"
+        f"Futures: {resolved['symbol']} (expires {resolved['expiry']})\n"
+        f"Call Wall: {levels_ref.get('call_wall', 'N/A')} | Put Wall: {levels_ref.get('put_wall', 'N/A')}"
+    ))
+
+    try:
+        feed.start()
+        # Main thread stays alive — WebSocket runs in its daemon thread
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[INFO] Stopped live monitoring.", flush=True)
+        print("\n[INFO] Stopping…", flush=True)
+        feed.stop()
+        print("[INFO] WebSocket feed stopped. Goodbye.", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Institutional Orderflow & Lead-Lag Trading Engine")
-    parser.add_argument("--simulate", action="store_true", help="Run with simulated market feed")
-    parser.add_argument("--broker", choices=["angel", "dhan"], default="angel", help="Broker to use (default: angel)")
+    parser.add_argument("--simulate",  action="store_true", help="Run with simulated market feed")
+    parser.add_argument("--backtest",  action="store_true", help="Run backtester on signals_history.csv")
+    parser.add_argument("--last",      type=int, default=None, help="(backtest) Only last N signals")
+    parser.add_argument("--show-trades", action="store_true",  help="(backtest) Verbose per-trade output")
+    parser.add_argument("--broker",    choices=["angel", "dhan"], default="angel", help="Broker to use (default: angel)")
     args = parser.parse_args()
 
-    if args.simulate:
+    if args.backtest:
+        from backtester import run_backtest
+        run_backtest(limit=args.last, verbose=args.show_trades)
+    elif args.simulate:
         run_simulation()
     elif args.broker == "angel":
         run_angel_live()

@@ -23,7 +23,12 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
+from market_hours import MarketHours
+
 logger = logging.getLogger("WebSocketFeed")
+
+# If no tick received for this many seconds → declare feed stale and reconnect
+HEARTBEAT_TIMEOUT_SECONDS = 45
 
 # Angel One SmartWebSocket subscription modes
 MODE_LTP        = 1   # Last Traded Price only
@@ -61,6 +66,8 @@ class WebSocketFeed:
         self._running = False
         self._reconnect_count = 0
         self._thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._last_tick_time: Optional[datetime] = None
 
         # Token → instrument mapping (populated in start())
         self._token_map: dict = {}
@@ -76,9 +83,13 @@ class WebSocketFeed:
             config.ANGEL_TOKENS["NIFTY_FUT"]["token"]:      "NIFTY_FUT",
         }
         self._running = True
+        self._last_tick_time = datetime.now()
         self._thread = threading.Thread(target=self._connect_loop, daemon=True, name="WebSocketFeed")
         self._thread.start()
-        logger.info("WebSocket feed thread started.")
+        # Start heartbeat watchdog
+        self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True, name="WSWatchdog")
+        self._watchdog_thread.start()
+        logger.info("WebSocket feed + heartbeat watchdog started.")
 
     def stop(self):
         """Gracefully stops the WebSocket feed."""
@@ -115,6 +126,33 @@ class WebSocketFeed:
             delay = RECONNECT_DELAY_SECONDS * min(self._reconnect_count, 6)
             logger.info(f"Reconnecting in {delay}s (attempt {self._reconnect_count}/{MAX_RECONNECT_ATTEMPTS})…")
             time.sleep(delay)
+
+    def _watchdog_loop(self):
+        """Monitors tick activity and force-reconnects if feed stalls during market hours."""
+        logger.info(f"[WATCHDOG] Tick watchdog active (timeout: {HEARTBEAT_TIMEOUT_SECONDS}s).")
+        while self._running:
+            time.sleep(10)
+            if not self._running:
+                break
+
+            # Only enforce watchdog during active market hours
+            if not MarketHours.is_market_open():
+                continue
+
+            if self._last_tick_time:
+                elapsed = (datetime.now() - self._last_tick_time).total_seconds()
+                if elapsed > HEARTBEAT_TIMEOUT_SECONDS:
+                    logger.warning(
+                        f"[WATCHDOG] Tick feed stale! No tick received for {elapsed:.1f}s. "
+                        f"Forcing WebSocket reconnect..."
+                    )
+                    self._fire("on_error", f"Watchdog timeout: no tick for {elapsed:.1f}s")
+                    if self._ws:
+                        try:
+                            self._ws.close_connection()
+                        except Exception:
+                            pass
+                    self._last_tick_time = datetime.now()
 
     def _establish_connection(self):
         """Creates SmartWebSocket and sets up callbacks."""
@@ -193,6 +231,7 @@ class WebSocketFeed:
         Prices are in paise (divide by 100 to get rupees).
         """
         try:
+            self._last_tick_time = datetime.now()
             # message may be bytes or dict depending on SDK version
             if isinstance(message, (bytes, bytearray)):
                 data = json.loads(message.decode("utf-8"))
@@ -256,11 +295,13 @@ def build_callbacks(
     logger_obj,
     levels_ref: dict,
     state_ref: dict,
+    mtf_filter=None,
 ) -> dict:
     """
     Returns a callbacks dict wired to all engine components.
     levels_ref  : mutable dict updated by OptionChainFetcher — passed by reference
     state_ref   : mutable dict for cross-tick state (prev_vol, prev_oi, etc.)
+    mtf_filter  : MultiTimeframeFilter instance for higher timeframe (15M) bias
     """
     from confluence_engine import ConfluenceEngine
 
@@ -294,11 +335,14 @@ def build_callbacks(
                 )
                 notifier.send_alert("LIVE LEAD-LAG SIGNAL", msg)
 
+            mtf_state = mtf_filter.get_bias() if mtf_filter else None
             confluence = ConfluenceEngine.evaluate_setup(
                 current_price=ltp, symbol="NIFTY",
                 vwap_state=n_state, levels=levels_ref,
                 whale_alert=state_ref["last_whale"], lead_lag_state=ll_state,
-                timestamp=tick["timestamp"]
+                timestamp=tick["timestamp"],
+                mtf_state=mtf_state,
+                is_simulated=False
             )
             if confluence and confluence["score"] >= ConfluenceEngine.MIN_A_PLUS_SCORE:
                 notifier.send_alert("A+ INSTITUTIONAL SETUP", confluence["formatted_message"])

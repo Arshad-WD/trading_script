@@ -15,6 +15,9 @@ from trade_logger import SignalLogger
 from instrument_manager import update_config_tokens
 from option_chain_fetcher import OptionChainFetcher
 from websocket_feed import WebSocketFeed, build_callbacks
+from market_hours import MarketHours
+from mtf_filter import MultiTimeframeFilter
+from position_sizer import PositionSizer
 
 def display_economic_news():
     """
@@ -138,7 +141,8 @@ def run_simulation():
                 current_price=nifty_price, symbol="NIFTY",
                 vwap_state=n_state, levels=levels,
                 whale_alert=last_whale_alert, lead_lag_state=ll_state,
-                timestamp=sim_time
+                timestamp=sim_time,
+                is_simulated=True
             )
             if confluence_setup and confluence_setup["score"] >= ConfluenceEngine.MIN_A_PLUS_SCORE:
                 # Deliver A+ setup alert
@@ -268,7 +272,20 @@ def run_angel_live():
     _oc_thread = threading.Thread(target=_oc_sync_loop, daemon=True, name="OptionChainSync")
     _oc_thread.start()
 
-    # ── STEP 3: WebSocket real-time feed ───────────────────────────────────
+    # ── STEP 3: Multi-Timeframe (15M) Trend Filter ─────────────────────────
+    mtf_filter = MultiTimeframeFilter(smart_api=client.smart_api)
+    mtf_filter.start_background_tracker()
+
+    # ── STEP 4: Market Hours Check ─────────────────────────────────────────
+    phase = MarketHours.session_phase()
+    is_open = MarketHours.is_market_open()
+    print(f"[MARKET STATUS] Current IST: {MarketHours.now_ist().strftime('%Y-%m-%d %H:%M:%S')} | Session: {phase}", flush=True)
+    if not is_open:
+        secs = MarketHours.seconds_to_open()
+        h, m = secs // 3600, (secs % 3600) // 60
+        print(f"[MARKET STATUS] Market is currently CLOSED. Next open in ~{h}h {m}m. Engine in standby mode.\n", flush=True)
+
+    # ── STEP 5: WebSocket real-time feed ───────────────────────────────────
     state_ref = {}   # mutable cross-tick state container
     callbacks = build_callbacks(
         vwap_tracker_nifty=nifty_vwap,
@@ -281,15 +298,20 @@ def run_angel_live():
         logger_obj=sig_logger,
         levels_ref=levels_ref,
         state_ref=state_ref,
+        mtf_filter=mtf_filter,
     )
     feed = WebSocketFeed(angel_client=client, callbacks=callbacks)
 
     print("[INFO] Starting real-time WebSocket feed. Press Ctrl+C to exit.\n", flush=True)
+    mtf_bias = mtf_filter.get_bias()
     notifier.send_alert("SYSTEM", (
-        f"🚀 Trading Engine LIVE\n"
+        f"🚀 Trading Engine LIVE (Institutional Grade)\n"
         f"Mode: WebSocket (tick-by-tick)\n"
+        f"Market Session: {phase}\n"
         f"Futures: {resolved['symbol']} (expires {resolved['expiry']})\n"
-        f"Call Wall: {levels_ref.get('call_wall', 'N/A')} | Put Wall: {levels_ref.get('put_wall', 'N/A')}"
+        f"15M Macro Trend: {mtf_bias.get('trend')} ({mtf_bias.get('strength')})\n"
+        f"Call Wall: {levels_ref.get('call_wall', 'N/A')} | Put Wall: {levels_ref.get('put_wall', 'N/A')}\n"
+        f"Position Sizing: Active (1% Risk Budget)"
     ))
 
     try:

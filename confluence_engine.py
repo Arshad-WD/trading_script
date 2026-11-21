@@ -1,16 +1,20 @@
 from datetime import datetime, time, timedelta
+from market_hours import MarketHours
+from position_sizer import PositionSizer
+
 
 class ConfluenceEngine:
     """
     Institutional Confluence & Quality Scoring Engine:
     Filters out low-probability noise and grades trading setups (A+, B, or Avoid).
-    
+
     Scoring Model (0 to 100 Points):
     1. Key Level / Wall Proximity: 25 Points
     2. Order Flow Absorption / Whale Confirmation: 25 Points
     3. VWAP Band Stretch / Mean Reversion: 25 Points
     4. BankNifty Lead-Lag Alignment: 25 Points
-    5. Time-of-Day Filter Penalty: -15 Points during low-volume lunch chop
+    5. Higher Timeframe (15M) Macro Trend Alignment: +15 Bonus / -20 Penalty
+    6. Time-of-Day Filter Penalty: -15 Points during low-volume lunch chop / noise
     """
 
     MIN_A_PLUS_SCORE = 75
@@ -21,20 +25,25 @@ class ConfluenceEngine:
                        vwap_state: dict, levels: dict,
                        whale_alert: dict | None, lead_lag_state: dict,
                        timestamp: datetime | None = None,
-                       cooldown_minutes: int = 3) -> dict | None:
+                       cooldown_minutes: int = 3,
+                       mtf_state: dict | None = None,
+                       is_simulated: bool = False) -> dict | None:
         if timestamp is None:
             timestamp = datetime.now()
 
-        # Cooldown check: prevent duplicate signals within cooldown_minutes
+        # ── 0. Market Hours Guard ─────────────────────────────────────────────
+        if not is_simulated and not MarketHours.is_market_open(timestamp):
+            return None
+
+        # ── Cooldown Check ────────────────────────────────────────────────────
         last_time = cls._last_signal_time.get(symbol)
         if last_time and (timestamp - last_time).total_seconds() < (cooldown_minutes * 60):
             return None
 
-        current_time = timestamp.time()
         score = 0
         factors = []
         direction = "NEUTRAL"
-        
+
         call_wall = levels.get("call_wall", 0.0)
         put_wall = levels.get("put_wall", 0.0)
         vwap = vwap_state.get("vwap", current_price)
@@ -62,7 +71,7 @@ class ConfluenceEngine:
         if whale_alert:
             result = whale_alert.get("result", "")
             bias = whale_alert.get("bias", "")
-            
+
             if "ABSORBED" in result or bias == "REVERSAL_LIKELY":
                 score += 25
                 factors.append(f"Volume Absorption ({whale_alert.get('volume', 0):,} lots absorbed)")
@@ -104,16 +113,30 @@ class ConfluenceEngine:
             factors.append("Caution: BankNifty & Nifty diverging")
 
         # -------------------------------------------------------------
-        # 5. Time-of-Day Filter (Chop penalty / Prime hours bonus)
+        # 5. Multi-Timeframe (15M) Macro Trend Filter (+15 / -20 Pts)
         # -------------------------------------------------------------
-        lunch_chop = time(11, 45) <= current_time <= time(13, 15)
-        opening_noise = time(9, 15) <= current_time <= time(9, 25)
-        prime_window = (time(9, 30) <= current_time <= time(11, 30)) or (time(13, 30) <= current_time <= time(15, 15))
+        if mtf_state:
+            macro_trend = mtf_state.get("trend", "NEUTRAL")
+            if direction == "LONG" and macro_trend == "BULLISH":
+                score += 15
+                factors.append(f"15M Macro Trend Confirmed: BULLISH (EMA: {mtf_state.get('ema_fast')})")
+            elif direction == "SHORT" and macro_trend == "BEARISH":
+                score += 15
+                factors.append(f"15M Macro Trend Confirmed: BEARISH (EMA: {mtf_state.get('ema_fast')})")
+            elif direction == "LONG" and macro_trend == "BEARISH":
+                score -= 20
+                factors.append("Counter-Trend Penalty: Trading LONG against 15M BEARISH trend (-20 pts)")
+            elif direction == "SHORT" and macro_trend == "BULLISH":
+                score -= 20
+                factors.append("Counter-Trend Penalty: Trading SHORT against 15M BULLISH trend (-20 pts)")
 
-        if lunch_chop or opening_noise:
+        # -------------------------------------------------------------
+        # 6. Time-of-Day Filter (Chop penalty / Prime hours bonus)
+        # -------------------------------------------------------------
+        if MarketHours.is_lunch_chop(timestamp) or MarketHours.is_opening_noise(timestamp):
             score = max(0, score - 15)
             factors.append("Penalty: Low-volume chop / open noise window")
-        elif prime_window:
+        elif MarketHours.is_prime_window(timestamp):
             score = min(100, score + 5)
             factors.append("Bonus: Prime institutional trading hours")
 
@@ -126,7 +149,7 @@ class ConfluenceEngine:
         cls._last_signal_time[symbol] = timestamp
 
         # -------------------------------------------------------------
-        # 6. Calculate Invalidation (Stop Loss) and Targets
+        # 7. Calculate Invalidation (Stop Loss) and Targets
         # -------------------------------------------------------------
         if direction == "SHORT":
             sl_price = round(max(current_price + 8.0, call_wall + 5.0 if near_call_wall else current_price + 10.0), 2)
@@ -143,6 +166,12 @@ class ConfluenceEngine:
         reward = abs(target_1 - current_price)
         rr_ratio = f"1 : {reward / risk:.1f}"
 
+        # -------------------------------------------------------------
+        # 8. Institutional Position Sizing (Risk Management)
+        # -------------------------------------------------------------
+        sizer = PositionSizer()
+        sizing = sizer.calculate(symbol=symbol, entry=current_price, sl=sl_price)
+
         grade = "A+ INSTITUTIONAL SETUP"
         icon = "🔥"
 
@@ -154,7 +183,11 @@ class ConfluenceEngine:
             f"Stop-Loss  : {sl_price:.2f} (Risk: {risk:.1f} pts)\n"
             f"Target 1   : {target_1:.2f} (Mean Reversion)\n"
             f"Target 2   : {target_2:.2f} (Macro Target)\n"
-            f"Risk/Reward: {rr_ratio}\n"
+            f"Risk/Reward: {rr_ratio}\n\n"
+            f"📐 Position Sizing (1% Risk Budget):\n"
+            f"  • Recommended Lots : {sizing['lots']} ({sizing['lots'] * sizing['lot_size']} Qty)\n"
+            f"  • Max Capital Risk : ₹{sizing['total_risk']:,} ({sizing['capital_pct']}% of Capital)\n"
+            f"  • Approx Margin    : ~₹{sizing['margin_estimate']:,}\n\n"
             f"Confluence Factors:\n" + "\n".join([f"  • {f}" for f in factors])
         )
 
@@ -168,5 +201,6 @@ class ConfluenceEngine:
             "target_1": target_1,
             "target_2": target_2,
             "risk_reward": rr_ratio,
+            "position_sizing": sizing,
             "formatted_message": formatted_msg
         }

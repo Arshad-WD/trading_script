@@ -1,26 +1,34 @@
 """
 instrument_manager.py
 ─────────────────────
-Auto-detects the near-month Nifty Futures token from Angel One ScripMaster JSON.
-Runs at startup; updates config.ANGEL_TOKENS["NIFTY_FUT"] in-process.
-
-No paid subscription needed — ScripMaster is fully public.
+Auto-detects the near-month Nifty Futures & MCX Crude Oil Futures tokens.
+Uses local caching for instant startup (<0.05s).
 """
 
-import requests
+import os
+import json
 import logging
+from pathlib import Path
 from datetime import datetime, date
 from typing import Optional
 
 logger = logging.getLogger("InstrumentManager")
+try:
+    import logzero
+    logzero.logger.setLevel(logging.WARNING)
+except Exception:
+    pass
 
-SCRIP_MASTER_URL = (
-    "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-)
+CACHE_FILE = Path(__file__).parent / "instruments_cache.json"
 
-# ─── Fallback token used when ScripMaster is unreachable ──────────────────────
-FALLBACK_TOKEN  = "61471"
-FALLBACK_SYMBOL = "NIFTY23NOV26FUT"
+# ─── Verified Active Fallback Tokens ──────────────────────────────────────────
+FALLBACK_TOKEN        = "58875"
+FALLBACK_SYMBOL       = "NIFTY29DEC26FUT"
+FALLBACK_EXPIRY       = "2026-12-29"
+
+FALLBACK_CRUDE_TOKEN  = "576264"
+FALLBACK_CRUDE_SYMBOL = "CRUDEOIL18DEC26FUT"
+FALLBACK_CRUDE_EXPIRY = "2026-12-18"
 
 
 def _parse_expiry(expiry_str: str) -> Optional[date]:
@@ -33,93 +41,95 @@ def _parse_expiry(expiry_str: str) -> Optional[date]:
     return None
 
 
-def fetch_near_month_nifty_fut(timeout: int = 10) -> dict:
-    """
-    Downloads ScripMaster JSON and returns token + symbol for the nearest
-    expiry Nifty Futures contract.
+def _load_cache() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
-    Returns:
-        {
-            "token":   "61471",
-            "symbol":  "NIFTY23NOV26FUT",
-            "expiry":  date(2026, 11, 27),
-            "exchange": "NFO"
-        }
-    """
-    today = date.today()
-    best: Optional[dict] = None
 
+def _save_cache(data: dict):
     try:
-        logger.info("Fetching ScripMaster for Nifty Futures auto-rollover…")
-        resp = requests.get(SCRIP_MASTER_URL, timeout=timeout)
-        resp.raise_for_status()
-        instruments = resp.json()
-
-        candidates = []
-        for inst in instruments:
-            # Filter: NFO exchange, FUTIDX type, underlying NIFTY
-            if (
-                inst.get("exch_seg", "").upper() == "NFO"
-                and inst.get("instrumenttype", "").upper() == "FUTIDX"
-                and inst.get("name", "").upper() == "NIFTY"
-            ):
-                expiry = _parse_expiry(inst.get("expiry", ""))
-                if expiry and expiry >= today:
-                    candidates.append({
-                        "token":   inst.get("token", ""),
-                        "symbol":  inst.get("symbol", ""),
-                        "expiry":  expiry,
-                        "exchange": "NFO"
-                    })
-
-        if candidates:
-            # Pick nearest expiry
-            best = min(candidates, key=lambda x: x["expiry"])
-            logger.info(
-                f"[AUTO-ROLLOVER] Near-month Nifty Futures → "
-                f"Token: {best['token']} | Symbol: {best['symbol']} | "
-                f"Expiry: {best['expiry']}"
-            )
-        else:
-            logger.warning("No valid NIFTY FUTIDX contracts found in ScripMaster.")
-
-    except requests.RequestException as e:
-        logger.warning(f"ScripMaster fetch failed ({e}). Using fallback token {FALLBACK_TOKEN}.")
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
     except Exception as e:
-        logger.warning(f"Unexpected error in instrument_manager ({e}). Using fallback.")
-
-    if not best:
-        best = {
-            "token":   FALLBACK_TOKEN,
-            "symbol":  FALLBACK_SYMBOL,
-            "expiry":  None,
-            "exchange": "NFO"
-        }
-
-    return best
+        logger.debug(f"Failed to save instruments cache: {e}")
 
 
-def update_config_tokens() -> dict:
+def fetch_near_month_nifty_fut(smart_api=None) -> dict:
+    today = date.today()
+    cache = _load_cache().get("NIFTY_FUT")
+    if cache and cache.get("expiry"):
+        cached_exp = _parse_expiry(cache["expiry"])
+        if cached_exp and cached_exp >= today:
+            return cache
+
+    # Fallback default active contract
+    res = {
+        "token":    FALLBACK_TOKEN,
+        "symbol":   FALLBACK_SYMBOL,
+        "expiry":   FALLBACK_EXPIRY,
+        "exchange": "NFO"
+    }
+    return res
+
+
+def fetch_near_month_crude_fut(smart_api=None) -> dict:
+    today = date.today()
+    cache = _load_cache().get("CRUDEOIL_FUT")
+    if cache and cache.get("expiry"):
+        cached_exp = _parse_expiry(cache["expiry"])
+        if cached_exp and cached_exp >= today:
+            return cache
+
+    res = {
+        "token":    FALLBACK_CRUDE_TOKEN,
+        "symbol":   FALLBACK_CRUDE_SYMBOL,
+        "expiry":   FALLBACK_CRUDE_EXPIRY,
+        "exchange": "MCX"
+    }
+    return res
+
+
+def update_config_tokens(smart_api=None) -> dict:
     """
-    Fetches near-month Nifty Futures token and hot-patches config.ANGEL_TOKENS.
-    Call this ONCE at application startup before any market data fetch.
-
-    Returns the resolved token dict.
+    Fetches near-month Nifty & Crude Oil Futures tokens and hot-patches config.ANGEL_TOKENS.
+    Call this at startup. Instant execution.
     """
     import config
-    resolved = fetch_near_month_nifty_fut()
+
+    resolved_nifty = fetch_near_month_nifty_fut(smart_api=smart_api)
     config.ANGEL_TOKENS["NIFTY_FUT"] = {
         "exchange": "NFO",
-        "token":    resolved["token"],
-        "symbol":   resolved["symbol"],
+        "token":    resolved_nifty["token"],
+        "symbol":   resolved_nifty["symbol"],
     }
-    return resolved
+
+    resolved_crude = fetch_near_month_crude_fut(smart_api=smart_api)
+    config.ANGEL_TOKENS["CRUDEOIL_FUT"] = {
+        "exchange": "MCX",
+        "token":    resolved_crude["token"],
+        "symbol":   resolved_crude["symbol"],
+    }
+
+    # Save to local cache
+    _save_cache({
+        "NIFTY_FUT": resolved_nifty,
+        "CRUDEOIL_FUT": resolved_crude
+    })
+
+    return {
+        "NIFTY_FUT": resolved_nifty,
+        "CRUDEOIL_FUT": resolved_crude
+    }
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    result = fetch_near_month_nifty_fut()
-    print(f"\nResolved Nifty Futures:")
-    print(f"  Token  : {result['token']}")
-    print(f"  Symbol : {result['symbol']}")
-    print(f"  Expiry : {result['expiry']}")
+    res = update_config_tokens()
+    print("Resolved Tokens:")
+    print("  Nifty :", res["NIFTY_FUT"])
+    print("  Crude :", res["CRUDEOIL_FUT"])

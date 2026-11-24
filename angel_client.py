@@ -118,6 +118,7 @@ class AngelClientManager:
                     config.ANGEL_TOKENS["BANKNIFTY_SPOT"]["token"],
                 ],
                 "NFO": [config.ANGEL_TOKENS["NIFTY_FUT"]["token"]],
+                "MCX": [config.ANGEL_TOKENS["CRUDEOIL_FUT"]["token"]],
             }
 
         try:

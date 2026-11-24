@@ -1,0 +1,14 @@
+{
+  "NIFTY_FUT": {
+    "token": "58875",
+    "symbol": "NIFTY29DEC26FUT",
+    "expiry": "2026-12-29",
+    "exchange": "NFO"
+  },
+  "CRUDEOIL_FUT": {
+    "token": "576264",
+    "symbol": "CRUDEOIL18DEC26FUT",
+    "expiry": "2026-12-18",
+    "exchange": "MCX"
+  }
+}

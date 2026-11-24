@@ -179,21 +179,14 @@ def run_simulation():
 def run_angel_live():
     """
     Connects to Angel One SmartAPI with:
-      - Auto-rollover Nifty Futures token (instrument_manager)
-      - Real-time WebSocket feed instead of 2s REST polling (websocket_feed)
+      - Auto-rollover Nifty & MCX Crude Oil Futures tokens (instrument_manager)
+      - Real-time WebSocket tick-by-tick streaming for NSE & MCX
       - Live option chain levels refreshed every 5 min (option_chain_fetcher)
+      - Multi-Asset VWAP, Iceberg & Whale absorption monitoring
     """
     print("\n" + "="*65, flush=True)
-    print("   CONNECTING TO LIVE ANGEL ONE SMARTAPI (REAL-TIME FEED)", flush=True)
+    print("   CONNECTING TO LIVE ANGEL ONE SMARTAPI (MULTI-ASSET FEED)", flush=True)
     print("="*65 + "\n", flush=True)
-
-    # ── STEP 1: Auto-rollover Nifty Futures token ──────────────────────────
-    resolved = update_config_tokens()
-    print(
-        f"[AUTO-ROLLOVER] Nifty Futures → Token: {resolved['token']} | "
-        f"Symbol: {resolved['symbol']} | Expiry: {resolved['expiry']}",
-        flush=True
-    )
 
     client = AngelClientManager()
     if not client.is_connected():
@@ -203,70 +196,79 @@ def run_angel_live():
     print(f"[SUCCESS] Connected to Angel One! User: {client.user_profile.get('name')}", flush=True)
     display_economic_news()
 
-    notifier  = TelegramNotifier()
+    # ── STEP 1: Auto-rollover Futures tokens (Nifty + MCX Crude Oil) ───────
+    resolved_tokens = update_config_tokens(smart_api=client.smart_api)
+    nifty_fut = resolved_tokens.get("NIFTY_FUT", {})
+    crude_fut = resolved_tokens.get("CRUDEOIL_FUT", {})
+    print(
+        f"[AUTO-ROLLOVER] Nifty Futures    → Token: {nifty_fut.get('token')} | "
+        f"Symbol: {nifty_fut.get('symbol')} | Expiry: {nifty_fut.get('expiry')}",
+        flush=True
+    )
+    print(
+        f"[AUTO-ROLLOVER] MCX Crude Oil   → Token: {crude_fut.get('token')} | "
+        f"Symbol: {crude_fut.get('symbol')} | Expiry: {crude_fut.get('expiry')}",
+        flush=True
+    )
+
+    notifier   = TelegramNotifier()
     sig_logger = SignalLogger()
     nifty_vwap = VWAPTracker("NIFTY")
     bn_vwap    = VWAPTracker("BANKNIFTY")
+    crude_vwap = VWAPTracker("CRUDEOIL")
     lead_lag   = LeadLagMonitor(divergence_threshold_pct=0.20)
     iceberg_detector = IcebergAbsorptionDetector(
         volume_threshold=config.WHALE_VOLUME_THRESHOLD,
         price_tolerance_points=config.ABSORPTION_PRICE_POINTS,
         window_seconds=config.EVALUATION_WINDOW_SECONDS
     )
+    crude_iceberg = IcebergAbsorptionDetector(
+        volume_threshold=config.ASSET_CONFIGS["CRUDEOIL"]["whale_volume"],
+        price_tolerance_points=config.ASSET_CONFIGS["CRUDEOIL"]["absorption_points"],
+        window_seconds=20
+    )
 
-    # Initial REST snapshot for day-open reference
-    data      = client.get_spot_and_futures()
-    n_spot0   = data.get(config.ANGEL_TOKENS["NIFTY_SPOT"]["token"], {})
-    bn_spot0  = data.get(config.ANGEL_TOKENS["BANKNIFTY_SPOT"]["token"], {})
+    # Initial REST snapshot
+    data       = client.get_spot_and_futures()
+    n_spot0    = data.get(config.ANGEL_TOKENS["NIFTY_SPOT"]["token"], {})
+    bn_spot0   = data.get(config.ANGEL_TOKENS["BANKNIFTY_SPOT"]["token"], {})
     nifty_fut0 = data.get(config.ANGEL_TOKENS["NIFTY_FUT"]["token"], {})
+    crude_fut0 = data.get(config.ANGEL_TOKENS["CRUDEOIL_FUT"]["token"], {})
 
     print(f"\n[SNAPSHOT]")
     print(f"  NIFTY SPOT:    LTP {n_spot0.get('ltp')} | Open: {n_spot0.get('open')} | Chg: {n_spot0.get('percent_change')}%")
     print(f"  BANKNIFTY:     LTP {bn_spot0.get('ltp')} | Open: {bn_spot0.get('open')} | Chg: {bn_spot0.get('percent_change')}%")
-    print(f"  NIFTY FUTURES: LTP {nifty_fut0.get('ltp')} | Vol: {nifty_fut0.get('volume', 0):,} | OI: {nifty_fut0.get('oi', 0):,}\n")
+    print(f"  NIFTY FUTURES: LTP {nifty_fut0.get('ltp')} | Vol: {nifty_fut0.get('volume', 0):,} | OI: {nifty_fut0.get('oi', 0):,}")
+    print(f"  CRUDE OIL FUT: LTP {crude_fut0.get('ltp')} | Vol: {crude_fut0.get('volume', 0):,} | OI: {crude_fut0.get('oi', 0):,} | VWAP: {crude_fut0.get('avg_price', 0):,}\n")
 
     if n_spot0.get("open", 0) > 0 and bn_spot0.get("open", 0) > 0:
         lead_lag.set_day_open(n_spot0["open"], bn_spot0["open"])
 
     # ── STEP 2: Option chain fetcher (5-min background refresh) ───────────
-    # levels_ref is a plain dict; OptionChainFetcher writes into it via threading lock
     levels_ref = {
-        "call_wall":  0.0,
-        "put_wall":   0.0,
-        "gamma_plus": 0.0,
-        "gamma_minus": 0.0,
-        "max_pain":   0.0,
-        "pcr":        0.0,
+        "call_wall":  25200.0,
+        "put_wall":   25000.0,
+        "gamma_plus": 25300.0,
+        "gamma_minus": 24900.0,
+        "max_pain":   25100.0,
+        "pcr":        0.95,
     }
     oc_fetcher = OptionChainFetcher(smart_api=client.smart_api)
-    # Fetch once synchronously so we have levels before WS starts
-    initial_levels = oc_fetcher.fetch_once()
-    if initial_levels:
-        levels_ref.update(initial_levels)
-        notifier.send_alert("OPTION CHAIN LEVELS", (
-            f"Call Wall  : {initial_levels['call_wall']} (OI: {initial_levels.get('call_wall_oi', 0):,})\n"
-            f"Put Wall   : {initial_levels['put_wall']}  (OI: {initial_levels.get('put_wall_oi', 0):,})\n"
-            f"Max Pain   : {initial_levels['max_pain']}\n"
-            f"PCR        : {initial_levels['pcr']}\n"
-            f"Expiry     : {initial_levels.get('expiry', 'N/A')}"
-        ))
-        print(f"[OC] Call Wall: {initial_levels['call_wall']} | Put Wall: {initial_levels['put_wall']} | PCR: {initial_levels['pcr']}", flush=True)
+    if MarketHours.is_market_open(exchange="NSE"):
+        initial_levels = oc_fetcher.fetch_once()
+        if initial_levels:
+            levels_ref.update(initial_levels)
+            print(f"[OC] Call Wall: {initial_levels['call_wall']} | Put Wall: {initial_levels['put_wall']} | PCR: {initial_levels['pcr']}", flush=True)
     else:
-        print("[OC] Option chain unavailable right now — using placeholder levels.", flush=True)
-        levels_ref.update({"call_wall": 25200.0, "put_wall": 25000.0})
+        print("[OC] NSE equity session closed — option chain in standby mode.", flush=True)
 
-    # Keep levels_ref in sync with OptionChainFetcher on background thread
     def _oc_sync_loop():
         while True:
             time.sleep(oc_fetcher.interval)
-            new_levels = oc_fetcher.fetch_once()
-            if new_levels:
-                levels_ref.update(new_levels)
-                print(
-                    f"[OC REFRESH] Call Wall: {new_levels['call_wall']} | "
-                    f"Put Wall: {new_levels['put_wall']} | PCR: {new_levels['pcr']}",
-                    flush=True
-                )
+            if MarketHours.is_market_open(exchange="NSE"):
+                new_levels = oc_fetcher.fetch_once()
+                if new_levels:
+                    levels_ref.update(new_levels)
 
     import threading
     _oc_thread = threading.Thread(target=_oc_sync_loop, daemon=True, name="OptionChainSync")
@@ -276,17 +278,18 @@ def run_angel_live():
     mtf_filter = MultiTimeframeFilter(smart_api=client.smart_api)
     mtf_filter.start_background_tracker()
 
-    # ── STEP 4: Market Hours Check ─────────────────────────────────────────
-    phase = MarketHours.session_phase()
-    is_open = MarketHours.is_market_open()
-    print(f"[MARKET STATUS] Current IST: {MarketHours.now_ist().strftime('%Y-%m-%d %H:%M:%S')} | Session: {phase}", flush=True)
-    if not is_open:
-        secs = MarketHours.seconds_to_open()
-        h, m = secs // 3600, (secs % 3600) // 60
-        print(f"[MARKET STATUS] Market is currently CLOSED. Next open in ~{h}h {m}m. Engine in standby mode.\n", flush=True)
+    # ── STEP 4: Market Hours Check (NSE & MCX) ─────────────────────────────
+    nse_phase = MarketHours.session_phase(exchange="NSE")
+    mcx_phase = MarketHours.session_phase(exchange="MCX")
+    nse_open  = MarketHours.is_market_open(exchange="NSE")
+    mcx_open  = MarketHours.is_market_open(exchange="MCX")
+
+    print(f"[MARKET STATUS] Current IST: {MarketHours.now_ist().strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"  • NSE (Equity / F&O): {nse_phase} ({'OPEN' if nse_open else 'CLOSED'})", flush=True)
+    print(f"  • MCX (Commodities) : {mcx_phase} ({'OPEN' if mcx_open else 'CLOSED'})\n", flush=True)
 
     # ── STEP 5: WebSocket real-time feed ───────────────────────────────────
-    state_ref = {}   # mutable cross-tick state container
+    state_ref = {}
     callbacks = build_callbacks(
         vwap_tracker_nifty=nifty_vwap,
         vwap_tracker_bn=bn_vwap,
@@ -299,19 +302,19 @@ def run_angel_live():
         levels_ref=levels_ref,
         state_ref=state_ref,
         mtf_filter=mtf_filter,
+        vwap_tracker_crude=crude_vwap,
+        iceberg_detector_crude=crude_iceberg,
     )
     feed = WebSocketFeed(angel_client=client, callbacks=callbacks)
 
-    print("[INFO] Starting real-time WebSocket feed. Press Ctrl+C to exit.\n", flush=True)
-    mtf_bias = mtf_filter.get_bias()
+    print("[INFO] Starting real-time WebSocket tick stream. Press Ctrl+C to exit.\n", flush=True)
     notifier.send_alert("SYSTEM", (
-        f"🚀 Trading Engine LIVE (Institutional Grade)\n"
-        f"Mode: WebSocket (tick-by-tick)\n"
-        f"Market Session: {phase}\n"
-        f"Futures: {resolved['symbol']} (expires {resolved['expiry']})\n"
-        f"15M Macro Trend: {mtf_bias.get('trend')} ({mtf_bias.get('strength')})\n"
-        f"Call Wall: {levels_ref.get('call_wall', 'N/A')} | Put Wall: {levels_ref.get('put_wall', 'N/A')}\n"
-        f"Position Sizing: Active (1% Risk Budget)"
+        f"🚀 Trading Engine LIVE (Multi-Asset)\n"
+        f"Mode: WebSocket (Tick-by-Tick Feed)\n"
+        f"NSE Session: {nse_phase} | MCX Session: {mcx_phase}\n"
+        f"Crude Oil FUT: {crude_fut.get('symbol')} (MCX)\n"
+        f"Nifty FUT: {nifty_fut.get('symbol')} (NFO)\n"
+        f"Live Ticks Streaming Active!"
     ))
 
     try:

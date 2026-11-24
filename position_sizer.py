@@ -21,11 +21,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Lot sizes per instrument (NSE circular)
+# Lot sizes per instrument (NSE / MCX)
 LOT_SIZES = {
-    "NIFTY":    25,
+    "NIFTY":     25,
     "BANKNIFTY": 15,
     "FINNIFTY":  40,
+    "CRUDEOIL":  100,  # MCX Crude Oil 100 Barrels
+    "CRUDEOILM": 10,   # MCX Crude Oil Mini 10 Barrels
 }
 
 # Default account size if not set in .env

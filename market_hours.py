@@ -44,6 +44,10 @@ NSE_HOLIDAYS_2026 = {
 MARKET_OPEN  = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
+# MCX Commodity Market Hours (09:00 AM to 11:30 PM IST)
+MCX_OPEN  = time(9, 0)
+MCX_CLOSE = time(23, 30)
+
 
 class MarketHours:
 
@@ -62,13 +66,15 @@ class MarketHours:
         return d.weekday() >= 5   # 5=Sat, 6=Sun
 
     @staticmethod
-    def is_market_open(now: datetime = None) -> bool:
-        """Returns True if market is currently open for trading."""
+    def is_market_open(now: datetime = None, exchange: str = "NSE") -> bool:
+        """Returns True if market is currently open for trading (NSE or MCX)."""
         now = now or MarketHours.now_ist()
         d = now.date()
         t = now.time()
         if MarketHours.is_weekend(d) or MarketHours.is_holiday(d):
             return False
+        if exchange.upper() == "MCX":
+            return MCX_OPEN <= t <= MCX_CLOSE
         return MARKET_OPEN <= t <= MARKET_CLOSE
 
     @staticmethod
@@ -103,11 +109,16 @@ class MarketHours:
         return time(14, 45) <= now.time() <= MARKET_CLOSE
 
     @staticmethod
-    def session_phase(now: datetime = None) -> str:
+    def session_phase(now: datetime = None, exchange: str = "NSE") -> str:
         """Human-readable phase name for logging."""
         now = now or MarketHours.now_ist()
-        if not MarketHours.is_market_open(now):
+        if not MarketHours.is_market_open(now, exchange=exchange):
             return "CLOSED"
+        if exchange.upper() == "MCX":
+            t = now.time()
+            if time(18, 30) <= t <= time(22, 30):
+                return "US_NYMEX_PEAK_HOURS"
+            return "MCX_COMMODITY_ACTIVE"
         if MarketHours.is_opening_noise(now):
             return "OPENING_NOISE"
         if MarketHours.is_lunch_chop(now):
@@ -119,13 +130,13 @@ class MarketHours:
         return "NORMAL"
 
     @staticmethod
-    def seconds_to_open() -> int:
+    def seconds_to_open(exchange: str = "NSE") -> int:
         """Returns seconds until next market open (0 if already open)."""
         now = MarketHours.now_ist()
-        if MarketHours.is_market_open(now):
+        if MarketHours.is_market_open(now, exchange=exchange):
             return 0
-        # Try today first
-        today_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        open_time = MCX_OPEN if exchange.upper() == "MCX" else MARKET_OPEN
+        today_open = now.replace(hour=open_time.hour, minute=open_time.minute, second=0, microsecond=0)
         if now < today_open and not MarketHours.is_weekend() and not MarketHours.is_holiday():
             return int((today_open - now).total_seconds())
         # Tomorrow
@@ -133,7 +144,7 @@ class MarketHours:
         next_day = now + timedelta(days=1)
         while MarketHours.is_weekend(next_day.date()) or MarketHours.is_holiday(next_day.date()):
             next_day += timedelta(days=1)
-        next_open = next_day.replace(hour=9, minute=15, second=0, microsecond=0)
+        next_open = next_day.replace(hour=open_time.hour, minute=open_time.minute, second=0, microsecond=0)
         return int((next_open - now).total_seconds())
 
 

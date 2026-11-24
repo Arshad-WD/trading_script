@@ -81,6 +81,7 @@ class WebSocketFeed:
             config.ANGEL_TOKENS["NIFTY_SPOT"]["token"]:    "NIFTY_SPOT",
             config.ANGEL_TOKENS["BANKNIFTY_SPOT"]["token"]: "BANKNIFTY_SPOT",
             config.ANGEL_TOKENS["NIFTY_FUT"]["token"]:      "NIFTY_FUT",
+            config.ANGEL_TOKENS["CRUDEOIL_FUT"]["token"]:   "CRUDEOIL_FUT",
         }
         self._running = True
         self._last_tick_time = datetime.now()
@@ -216,6 +217,12 @@ class WebSocketFeed:
                 "tokens": [
                     config.ANGEL_TOKENS["NIFTY_FUT"]["token"],
                 ]
+            },
+            {
+                "exchangeType": 5,   # 5 = MCX_FO (Commodity Futures)
+                "tokens": [
+                    config.ANGEL_TOKENS["CRUDEOIL_FUT"]["token"],
+                ]
             }
         ]
         self._ws.subscribe(correlation_id, MODE_SNAP_QUOTE, token_list)
@@ -266,6 +273,8 @@ class WebSocketFeed:
                 self._fire("on_bn_tick", tick)
             elif instrument == "NIFTY_FUT":
                 self._fire("on_futures_tick", tick)
+            elif instrument == "CRUDEOIL_FUT":
+                self._fire("on_crude_tick", tick)
 
             self._fire("on_any_tick", tick)
 
@@ -296,6 +305,8 @@ def build_callbacks(
     levels_ref: dict,
     state_ref: dict,
     mtf_filter=None,
+    vwap_tracker_crude=None,
+    iceberg_detector_crude=None,
 ) -> dict:
     """
     Returns a callbacks dict wired to all engine components.
@@ -313,6 +324,9 @@ def build_callbacks(
     state_ref.setdefault("bn_ltp",         0.0)
     state_ref.setdefault("nifty_vwap_state", {})
     state_ref.setdefault("bn_vwap_state",    {})
+    state_ref.setdefault("crude_ltp",      0.0)
+    state_ref.setdefault("prev_crude_vol", 0)
+    state_ref.setdefault("crude_tick_count", 0)
 
     def on_nifty_tick(tick: dict):
         ltp = tick["ltp"]
@@ -406,6 +420,47 @@ def build_callbacks(
                 state_ref["last_whale"] = alert
                 notifier.send_alert("WHALE ORDER ABSORPTION", alert["formatted_message"])
 
+    def on_crude_tick(tick: dict):
+        ltp = tick["ltp"]
+        vol = tick["volume"]
+        oi  = tick["oi"]
+        vwap = tick["avg_price"]
+        if ltp <= 0:
+            return
+
+        state_ref["crude_ltp"]  = ltp
+        state_ref["crude_vol"]  = vol
+        state_ref["crude_oi"]   = oi
+        state_ref["crude_vwap"] = vwap
+
+        now = tick["timestamp"]
+        c_state = vwap_tracker_crude.update(now, ltp, 100) if vwap_tracker_crude else {"vwap": vwap or ltp}
+
+        prev_vol = state_ref.get("prev_crude_vol", 0)
+        inc_vol  = (vol - prev_vol) if (prev_vol > 0 and vol >= prev_vol) else 0
+        state_ref["prev_crude_vol"] = vol
+
+        # Whale / Iceberg absorption check for Crude Oil
+        if inc_vol > 0 and iceberg_detector_crude:
+            call_wall = round(ltp / 50) * 50 + 50
+            put_wall  = round(ltp / 50) * 50 - 50
+            resolved = iceberg_detector_crude.on_tick(
+                timestamp=now, price=ltp,
+                incremental_volume=inc_vol, symbol="MCX:CRUDEOIL",
+                call_wall=call_wall, put_wall=put_wall
+            )
+            for alert in resolved:
+                notifier.send_alert("CRUDE OIL WHALE ABSORPTION", alert["formatted_message"])
+
+        step = state_ref.get("crude_tick_count", 0) + 1
+        state_ref["crude_tick_count"] = step
+        if step % 5 == 1:
+            print(
+                f"[{now.strftime('%H:%M:%S')}] [CRUDEOIL] LTP: {ltp:.2f} | "
+                f"Vol: {vol:,} | OI: {oi:,} | VWAP: {vwap:.2f}",
+                flush=True
+            )
+
     def on_connect():
         logger.info("[WS] Connected to Angel One real-time feed.")
         notifier.send_alert("SYSTEM", "✅ WebSocket connected — real-time feed active.")
@@ -420,6 +475,7 @@ def build_callbacks(
         "on_nifty_tick":    on_nifty_tick,
         "on_bn_tick":       on_bn_tick,
         "on_futures_tick":  on_futures_tick,
+        "on_crude_tick":    on_crude_tick,
         "on_connect":       on_connect,
         "on_disconnect":    on_disconnect,
         "on_error":         on_error,

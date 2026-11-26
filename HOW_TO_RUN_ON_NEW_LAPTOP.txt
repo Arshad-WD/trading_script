@@ -1,0 +1,59 @@
+========================================================================
+   HOW TO RUN THIS TRADING SCRIPT ON A FRESH WINDOWS LAPTOP
+========================================================================
+
+Follow these 3 simple steps (Takes less than 3 minutes):
+
+------------------------------------------------------------------------
+STEP 1: INSTALL PYTHON (Only once)
+------------------------------------------------------------------------
+1. Go to: https://www.python.org/downloads/
+2. Click the yellow button "Download Python 3.12" (or latest).
+3. Open the downloaded installer file.
+
+*** CRITICAL STEP (DO NOT MISS THIS) ***
+At the very bottom of the installer window, CHECK THE BOX:
+    [X] "Add python.exe to PATH"
+(If you don't check this box, Windows won't know where Python is!)
+
+4. Click "Install Now". Wait until it says "Setup was successful". Close it.
+
+
+------------------------------------------------------------------------
+STEP 2: EXTRACT THIS FOLDER
+------------------------------------------------------------------------
+1. Right-click the zip file `trading_script.zip`.
+2. Select "Extract All..." and click "Extract".
+3. Open the extracted folder.
+
+
+------------------------------------------------------------------------
+STEP 3: DOUBLE CLICK "start.bat"
+------------------------------------------------------------------------
+Just double-click the file named:
+    start.bat
+
+WHAT HAPPENS AUTOMATICALLY:
+• On the very first run, it will automatically install all needed trading
+  libraries (takes ~1 minute).
+• It loads the `.env` credentials automatically.
+• It connects to Angel One, shows your account name, and starts streaming
+  live ticks and alerts directly to your Telegram bot!
+
+On every day after this, just double-click `start.bat` whenever you want
+the script running. That's it!
+
+------------------------------------------------------------------------
+COMMON QUESTIONS:
+------------------------------------------------------------------------
+Q: How do I stop the script?
+A: Press `Ctrl + C` in the black window, or simply close the window.
+
+Q: Where do the alerts go?
+A: All institutional Whale alerts, VWAP crossovers, and A+ trade setups
+   are sent directly to your Telegram bot (@JenixYtBot).
+
+Q: Can I run this at night?
+A: Yes! The script monitors MCX Commodity markets (Crude Oil) until 11:30 PM IST,
+   and NSE Nifty / BankNifty during daytime hours (9:15 AM - 3:30 PM IST).
+========================================================================

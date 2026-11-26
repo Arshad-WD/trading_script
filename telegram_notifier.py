@@ -38,3 +38,18 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"Failed to deliver Telegram alert: {e}")
             return False
+
+    def send_document(self, file_path: str, caption: str = "") -> bool:
+        if not self.enabled:
+            return False
+
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendDocument"
+        try:
+            with open(file_path, "rb") as f:
+                files = {"document": f}
+                data = {"chat_id": self.chat_id, "caption": caption}
+                res = requests.post(url, data=data, files=files, timeout=30)
+                return res.status_code == 200
+        except Exception as e:
+            logger.error(f"Failed to send Telegram document: {e}")
+            return False
